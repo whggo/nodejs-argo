@@ -10,7 +10,7 @@ nodejs-argo是一个强大的Argo隧道部署工具，专为PaaS平台和游戏�
 
 ---
 
-Telegram交流反馈群组：https://t.me/eooceu
+JS混淆地址：https://obfuscator.io/
 </div>
 
 ## 说明 （部署前请仔细阅读）
