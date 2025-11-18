@@ -1,445 +1,558 @@
 #!/bin/bash
-# =========================================
-# 纯 VLESS + TCP + Reality 单节点
-# 翼龙面板专用：自动检测端口
-# 零冲突、Reality 伪装、XTLS 极速
-# 添加 Argo 隧道代理支持
-# =========================================
-set -uo pipefail
 
-# ========== 自动检测端口（翼龙环境变量优先）==========
-if [[ -n "${SERVER_PORT:-}" ]]; then
-  PORT="$SERVER_PORT"
-  echo "Port (env): $PORT"
-elif [[ $# -ge 1 && -n "$1" ]]; then
-  PORT="$1"
-  echo "Port (arg): $PORT"
+# 设置环境变量
+export UPLOAD_URL=${UPLOAD_URL:-""}
+export FILE_PATH=${FILE_PATH:-"./tmp"}
+export SUB_PATH=${SUB_PATH:-"sub"}
+export PORT=${SERVER_PORT:-${PORT:-"9808"}}
+export UUID=${UUID:-"133d8041-e8f3-4b60-b8ac-444e717f2551"}
+export ARGO_DOMAIN=${ARGO_DOMAIN:-"appwrite.777171.xyz"}
+export ARGO_AUTH=${ARGO_AUTH:-"eyJhIjoiMTZjM2Q3ZWUyZjlmZmRiZmVlY2IzYTJlMThkMDE2ZjgiLCJ0IjoiZTI3YzI5MWUtMGNlZS00MTVjLWE1ZmEtMjllZjY4OGIzYzk3IiwicyI6Ik1UQmhNakl5WlRFdE1XWmpOaTAwTnprNUxUaGpPVEF0TVdJM05EWTVaRFkxWkRaaSJ9"}
+export ARGO_PORT=${ARGO_PORT:-"8001"}
+export CFIP=${CFIP:-"cdns.doon.eu.org"}
+export CFPORT=${CFPORT:-"443"}
+export NAME=${NAME:-""}
+
+# 创建运行文件夹
+if [ ! -d "$FILE_PATH" ]; then
+    mkdir -p "$FILE_PATH"
+    echo "$FILE_PATH is created"
 else
-  PORT=3250
-  echo "Port (default): $PORT"
+    echo "$FILE_PATH already exists"
 fi
 
-# ========== Argo 隧道配置 ==========
-ARGO_DOMAIN="appwrite.777171.xyz"
-ARGO_TOKEN="eyJhIjoiMTZjM2Q3ZWUyZjlmZmRiZmVlY2IzYTJlMThkMDE2ZjgiLCJ0IjoiZTI3YzI5MWUtMGNlZS00MTVjLWE1ZmEtMjllZjY4OGIzYzk3IiwicyI6Ik1UQmhNakl5WlRFdE1XWmpOaTAwTnprNUxUaGpPVEF0TVdJM05EWTVaRFkxWkRaaSJ9"
-ARGO_BIN="./cloudflared"
-ARGO_CONFIG="argo_tunnel.yaml"
-
-# ========== 文件定义 ==========
-MASQ_DOMAIN="www.bing.com"
-VLESS_BIN="./xray"
-VLESS_CONFIG="vless-reality.json"
-VLESS_LINK="vless_link.txt"
-
-# ========== 系统检查 ==========
-check_system() {
-  echo "=== 系统信息 ==="
-  echo "系统架构: $(uname -m)"
-  echo "当前用户: $(whoami)"
-  echo "工作目录: $(pwd)"
-  echo "================"
+# 生成随机6位字符文件名
+generateRandomName() {
+    local characters='abcdefghijklmnopqrstuvwxyz'
+    local result=''
+    for ((i=0; i<6; i++)); do
+        result+=${characters:$((RANDOM % ${#characters})):1}
+    done
+    echo "$result"
 }
 
-# ========== 依赖检查 ==========
-check_dependencies() {
-  local deps=("curl" "unzip" "openssl")
-  for dep in "${deps[@]}"; do
-    if ! command -v "$dep" &> /dev/null; then
-      echo "错误: 缺少依赖 $dep"
-      return 1
+# 全局变量
+webName=$(generateRandomName)
+botName=$(generateRandomName)
+webPath="$FILE_PATH/$webName"
+botPath="$FILE_PATH/$botName"
+subPath="$FILE_PATH/sub.txt"
+bootLogPath="$FILE_PATH/boot.log"
+configPath="$FILE_PATH/config.json"
+
+# 清理历史文件
+cleanupOldFiles() {
+    if [ -d "$FILE_PATH" ]; then
+        find "$FILE_PATH" -maxdepth 1 -type f -delete 2>/dev/null || true
     fi
-  done
-  echo "所有依赖检查通过"
-  return 0
 }
 
-# ========== 加载已有配置 ==========
-load_config() {
-  if [[ -f "$VLESS_CONFIG" ]]; then
-    VLESS_UUID=$(grep -o '"id": "[^"]*' "$VLESS_CONFIG" | head -1 | cut -d'"' -f4)
-    echo "Loaded existing UUID: $VLESS_UUID"
-  fi
+# 生成xray配置文件
+generateConfig() {
+    cat > "$configPath" << EOF
+{
+  "log": {
+    "access": "/dev/null",
+    "error": "/dev/null",
+    "loglevel": "none"
+  },
+  "inbounds": [
+    {
+      "port": $ARGO_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none",
+        "fallbacks": [
+          {
+            "dest": 3001
+          },
+          {
+            "path": "/vless-argo",
+            "dest": 3002
+          },
+          {
+            "path": "/vmess-argo",
+            "dest": 3003
+          },
+          {
+            "path": "/trojan-argo",
+            "dest": 3004
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    },
+    {
+      "port": 3001,
+      "listen": "127.0.0.1",
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none"
+      }
+    },
+    {
+      "port": 3002,
+      "listen": "127.0.0.1",
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "level": 0
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "/vless-argo"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "metadataOnly": false
+      }
+    },
+    {
+      "port": 3003,
+      "listen": "127.0.0.1",
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "alterId": 0
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/vmess-argo"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "metadataOnly": false
+      }
+    },
+    {
+      "port": 3004,
+      "listen": "127.0.0.1",
+      "protocol": "trojan",
+      "settings": {
+        "clients": [
+          {
+            "password": "$UUID"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "/trojan-argo"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "metadataOnly": false
+      }
+    }
+  ],
+  "dns": {
+    "servers": ["https+local://8.8.8.8/dns-query"]
+  },
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ]
 }
-
-# ========== 下载 Xray ==========
-get_xray() {
-  if [[ ! -x "$VLESS_BIN" ]]; then
-    echo "下载 Xray v1.8.23..."
-    if ! curl -L -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v1.8.23/Xray-linux-64.zip" --fail --connect-timeout 15; then
-      echo "错误: 下载 Xray 失败"
-      return 1
-    fi
-    
-    if ! unzip -j xray.zip xray -d . >/dev/null 2>&1; then
-      echo "错误: 解压 Xray 失败"
-      rm -f xray.zip
-      return 1
-    fi
-    
-    rm -f xray.zip
-    chmod +x "$VLESS_BIN"
-    
-    # 验证 Xray 是否可用
-    if ! "$VLESS_BIN" version >/dev/null 2>&1; then
-      echo "错误: Xray 验证失败"
-      return 1
-    fi
-    echo "Xray 下载和验证成功"
-  else
-    echo "Xray 已存在"
-  fi
-}
-
-# ========== 下载和配置 Cloudflared ==========
-setup_argo() {
-  if [[ ! -x "$ARGO_BIN" ]]; then
-    echo "下载 Cloudflared..."
-    local arch=$(uname -m)
-    case "$arch" in
-      x86_64) local pkg="cloudflared-linux-amd64" ;;
-      aarch64) local pkg="cloudflared-linux-arm64" ;;
-      armv7l) local pkg="cloudflared-linux-arm" ;;
-      *) local pkg="cloudflared-linux-amd64" ;;
-    esac
-    
-    if ! curl -L -o "$ARGO_BIN" "https://github.com/cloudflare/cloudflared/releases/latest/download/$pkg" --fail --connect-timeout 15; then
-      echo "错误: 下载 Cloudflared 失败"
-      return 1
-    fi
-    
-    chmod +x "$ARGO_BIN"
-    echo "Cloudflared 下载成功"
-  fi
-
-  # 创建凭证文件
-  echo "创建 Argo 隧道凭证..."
-  cat > credentials.json <<EOF
-$ARGO_TOKEN
 EOF
+    echo "Config generated at $configPath"
+}
 
-  # 解析隧道信息
-  local tunnel_info=$(echo "$ARGO_TOKEN" | base64 -d 2>/dev/null || echo "")
-  local tunnel_id=""
-  
-  if [[ -n "$tunnel_info" ]]; then
-    tunnel_id=$(echo "$tunnel_info" | grep -o '"tunnelID":"[^"]*' | cut -d'"' -f4 2>/dev/null || echo "")
-  fi
-  
-  # 如果解析失败，使用默认值
-  if [[ -z "$tunnel_id" ]]; then
-    tunnel_id="argo-tunnel"
-  fi
+# 判断系统架构
+getSystemArchitecture() {
+    local arch
+    arch=$(uname -m)
+    case $arch in
+        arm*|aarch64)
+            echo "arm"
+            ;;
+        *)
+            echo "amd"
+            ;;
+    esac
+}
 
-  # 创建正确的 Argo 隧道配置（参考 JavaScript 版本）
-  cat > "$ARGO_CONFIG" <<EOF
-tunnel: $tunnel_id
-credentials-file: credentials.json
+# 下载文件
+downloadFile() {
+    local fileName=$1
+    local fileUrl=$2
+    
+    echo "Downloading $fileName from $fileUrl"
+    
+    if command -v curl >/dev/null 2>&1; then
+        curl -L -o "$fileName" "$fileUrl" >/dev/null 2>&1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$fileName" "$fileUrl" >/dev/null 2>&1
+    else
+        echo "Error: Neither curl nor wget is available"
+        return 1
+    fi
+    
+    if [ $? -eq 0 ] && [ -f "$fileName" ]; then
+        echo "Download $(basename "$fileName") successfully"
+        chmod +x "$fileName"
+        return 0
+    else
+        echo "Download $(basename "$fileName") failed"
+        return 1
+    fi
+}
+
+# 下载并运行依赖文件
+downloadFilesAndRun() {
+    local architecture
+    architecture=$(getSystemArchitecture)
+    
+    local webUrl botUrl
+    
+    if [ "$architecture" = "arm" ]; then
+        webUrl="https://arm64.ssss.nyc.mn/web"
+        botUrl="https://arm64.ssss.nyc.mn/bot"
+    else
+        webUrl="https://amd64.ssss.nyc.mn/web"
+        botUrl="https://amd64.ssss.nyc.mn/bot"
+    fi
+    
+    # 下载web文件
+    if ! downloadFile "$webPath" "$webUrl"; then
+        echo "Failed to download web file"
+        return 1
+    fi
+    
+    # 下载bot文件
+    if ! downloadFile "$botPath" "$botUrl"; then
+        echo "Failed to download bot file"
+        return 1
+    fi
+    
+    # 运行xray
+    echo "Starting $webName..."
+    nohup "$webPath" -c "$configPath" >/dev/null 2>&1 &
+    echo "$webName is running"
+    sleep 1
+    
+    # 运行cloudflared
+    echo "Starting $botName..."
+    local args
+    if [[ "$ARGO_AUTH" =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
+        args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $ARGO_AUTH"
+    elif [[ "$ARGO_AUTH" == *"TunnelSecret"* ]]; then
+        # 创建tunnel.yml
+        local tunnelSecret=$(echo "$ARGO_AUTH" | grep -o '"TunnelSecret":"[^"]*"' | cut -d'"' -f4)
+        cat > "$FILE_PATH/tunnel.yml" << EOF
+tunnel: $tunnelSecret
+credentials-file: $FILE_PATH/tunnel.json
 protocol: http2
 
 ingress:
   - hostname: $ARGO_DOMAIN
-    service: http://localhost:$PORT
+    service: http://localhost:$ARGO_PORT
     originRequest:
       noTLSVerify: true
   - service: http_status:404
 EOF
-
-  echo "Argo 隧道配置完成"
-  echo "隧道ID: $tunnel_id"
+        echo "$ARGO_AUTH" > "$FILE_PATH/tunnel.json"
+        args="tunnel --edge-ip-version auto --config $FILE_PATH/tunnel.yml run"
+    else
+        args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile $bootLogPath --loglevel info --url http://localhost:$ARGO_PORT"
+    fi
+    
+    nohup "$botPath" $args >/dev/null 2>&1 &
+    echo "$botName is running"
+    sleep 2
 }
 
-# ========== 生成 VLESS Reality 配置 ==========
-gen_vless_config() {
-  echo "生成 VLESS Reality 配置..."
-  
-  local shortId=$(openssl rand -hex 8)
-  
-  # 生成密钥对
-  local keys
-  if ! keys=$("$VLESS_BIN" x25519 2>/dev/null); then
-    echo "错误: 无法生成 X25519 密钥"
-    return 1
-  fi
-  
-  local priv=$(echo "$keys" | grep -i private | awk '{print $3}')
-  local pub=$(echo "$keys" | grep -i public | awk '{print $3}')
-  
-  # 验证密钥是否有效
-  if [[ -z "$priv" || -z "$pub" ]]; then
-    echo "错误: 生成的密钥无效"
-    return 1
-  fi
+# 获取临时隧道domain
+extractDomains() {
+    local argoDomain
+    
+    if [ -n "$ARGO_AUTH" ] && [ -n "$ARGO_DOMAIN" ]; then
+        argoDomain=$ARGO_DOMAIN
+        echo "ARGO_DOMAIN: $argoDomain"
+        generateLinks "$argoDomain"
+    else
+        # 等待boot.log文件生成
+        sleep 5
+        
+        if [ -f "$bootLogPath" ]; then
+            argoDomain=$(grep -o 'https://[^ ]*trycloudflare\.com' "$bootLogPath" | head -1 | sed 's|https://||')
+            if [ -n "$argoDomain" ]; then
+                echo "ArgoDomain: $argoDomain"
+                generateLinks "$argoDomain"
+            else
+                echo "ArgoDomain not found, retrying..."
+                sleep 10
+                extractDomains
+            fi
+        else
+            echo "boot.log not found, waiting..."
+            sleep 10
+            extractDomains
+        fi
+    fi
+}
 
-  cat > "$VLESS_CONFIG" <<EOF
+# 生成订阅链接
+generateLinks() {
+    local argoDomain=$1
+    
+    # 获取ISP信息
+    local metaInfo
+    if command -v curl >/dev/null 2>&1; then
+        metaInfo=$(curl -sm 5 https://speed.cloudflare.com/meta | awk -F\" '{print $26"-"$18}' | sed 's/ /_/g')
+    else
+        metaInfo="unknown-unknown"
+    fi
+    
+    local ISP=$(echo "$metaInfo" | tr -d '[:space:]')
+    local nodeName
+    if [ -n "$NAME" ]; then
+        nodeName="${NAME}-${ISP}"
+    else
+        nodeName="$ISP"
+    fi
+    
+    # 生成VMESS配置
+    local vmessConfig=$(cat << EOF
 {
-  "log": {"loglevel": "warning"},
-  "inbounds": [{
-    "port": $PORT,
-    "protocol": "vless",
-    "settings": {
-      "clients": [{"id": "$VLESS_UUID", "flow": "xtls-rprx-vision"}],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "tcp",
-      "security": "reality",
-      "realitySettings": {
-        "show": false,
-        "dest": "$MASQ_DOMAIN:443",
-        "xver": 0,
-        "serverNames": ["$MASQ_DOMAIN", "www.microsoft.com"],
-        "privateKey": "$priv",
-        "publicKey": "$pub",
-        "shortIds": ["$shortId"],
-        "fingerprint": "chrome",
-        "spiderX": "/"
-      }
-    },
-    "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
-  }],
-  "outbounds": [{"protocol": "freedom"}]
+  "v": "2",
+  "ps": "$nodeName",
+  "add": "$CFIP",
+  "port": "$CFPORT",
+  "id": "$UUID",
+  "aid": "0",
+  "scy": "none",
+  "net": "ws",
+  "type": "none",
+  "host": "$argoDomain",
+  "path": "/vmess-argo?ed=2560",
+  "tls": "tls",
+  "sni": "$argoDomain",
+  "alpn": "",
+  "fp": "firefox"
 }
 EOF
-
-  # 保存 Reality 信息
-  cat > reality_info.txt <<EOF
-Reality Public Key: $pub
-Reality Short ID: $shortId
-VLESS UUID: $VLESS_UUID
-Port: $PORT
-Argo Domain: $ARGO_DOMAIN
-Masquerade Domain: $MASQ_DOMAIN
-EOF
-
-  echo "VLESS 配置生成成功"
-}
-
-# ========== 生成客户端链接 ==========
-gen_link() {
-  local ip="$1"
-  local pub=$(grep "Public Key" reality_info.txt | awk '{print $4}')
-  local sid=$(grep "Short ID" reality_info.txt | awk '{print $4}')
-
-  # 生成直接连接链接
-  cat > "$VLESS_LINK" <<EOF
-=== 直接连接 ===
-vless://$VLESS_UUID@$ip:$PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$MASQ_DOMAIN&fp=chrome&pbk=$pub&sid=$sid&type=tcp&spx=/#VLESS-Reality-Direct
-
-=== Argo 隧道连接 ===
-vless://$VLESS_UUID@$ARGO_DOMAIN:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$MASQ_DOMAIN&fp=chrome&pbk=$pub&sid=$sid&type=tcp&spx=/#VLESS-Reality-Argo
-EOF
-
-  echo "========================================="
-  echo "VLESS + TCP + Reality 节点信息:"
-  echo "直接连接: $ip:$PORT"
-  echo "Argo 隧道: $ARGO_DOMAIN:443"
-  echo "UUID: $VLESS_UUID"
-  echo "Public Key: $pub"
-  echo "Short ID: $sid"
-  echo "========================================="
-  cat "$VLESS_LINK"
-  echo "========================================="
-}
-
-# ========== 检查端口占用 ==========
-check_port() {
-  if command -v netstat >/dev/null 2>&1; then
-    if netstat -tln | grep -q ":$PORT "; then
-      echo "警告: 端口 $PORT 已被占用"
-    fi
-  elif command -v ss >/dev/null 2>&1; then
-    if ss -tln | grep -q ":$PORT "; then
-      echo "警告: 端口 $PORT 已被占用"
-    fi
-  fi
-}
-
-# ========== 启动 Argo 隧道（使用 token 方式）==========
-start_argo_tunnel() {
-  echo "启动 Argo 隧道..."
-  
-  # 方法1：使用 token 直接运行（推荐）
-  if [[ "$ARGO_TOKEN" =~ ^eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*$ ]]; then
-    echo "使用 Token 方式启动 Argo 隧道..."
-    "$ARGO_BIN" tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token "$ARGO_TOKEN" &
-    local argo_pid=$!
-  # 方法2：使用配置文件
-  elif [[ -f "$ARGO_CONFIG" ]]; then
-    echo "使用配置文件启动 Argo 隧道..."
-    "$ARGO_BIN" tunnel --config "$ARGO_CONFIG" run &
-    local argo_pid=$!
-  # 方法3：使用快速隧道
-  else
-    echo "使用快速隧道..."
-    "$ARGO_BIN" tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --url "http://localhost:$PORT" &
-    local argo_pid=$!
-  fi
-  
-  # 等待隧道启动
-  sleep 10
-  
-  # 检查隧道是否正常运行
-  if ! kill -0 $argo_pid 2>/dev/null; then
-    echo "错误: Argo 隧道启动失败"
-    return 1
-  fi
-  
-  echo "Argo 隧道启动成功 (PID: $argo_pid)"
-  return $argo_pid
-}
-
-# ========== 启动服务 ==========
-run_services() {
-  echo "启动 VLESS Reality 服务..."
-  
-  # 检查端口
-  check_port
-  
-  # 先启动 Xray
-  echo "Starting Xray on port :$PORT..."
-  "$VLESS_BIN" run -c "$VLESS_CONFIG" &
-  local xray_pid=$!
-  
-  # 等待 Xray 启动
-  sleep 3
-  
-  # 检查 Xray 是否正常运行
-  if ! kill -0 $xray_pid 2>/dev/null; then
-    echo "错误: Xray 启动失败"
-    return 1
-  fi
-  
-  echo "Xray 启动成功 (PID: $xray_pid)"
-  
-  # 启动 Argo 隧道
-  local argo_pid
-  if start_argo_tunnel; then
-    argo_pid=$?
-  else
-    echo "尝试使用备用方式启动 Argo 隧道..."
-    # 备用方式：直接使用 token
-    "$ARGO_BIN" tunnel run --token "$ARGO_TOKEN" &
-    argo_pid=$!
-    sleep 10
+    )
     
-    if ! kill -0 $argo_pid 2>/dev/null; then
-      echo "Argo 隧道启动失败，但 Xray 仍在运行"
-      # 即使 Argo 失败，也继续运行 Xray
-      wait $xray_pid
-      return 1
-    fi
-  fi
-  
-  echo "所有服务启动完成!"
-  echo "Xray PID: $xray_pid"
-  echo "Argo Tunnel PID: $argo_pid"
-  
-  # 健康检查循环
-  local error_count=0
-  while [[ $error_count -lt 3 ]]; do
-    if ! kill -0 $xray_pid 2>/dev/null; then
-      echo "Xray 进程异常退出"
-      ((error_count++))
-    fi
-    if ! kill -0 $argo_pid 2>/dev/null; then
-      echo "Argo Tunnel 进程异常退出"
-      ((error_count++))
+    local encodedVmess=$(echo "$vmessConfig" | base64 -w 0)
+    
+    # 生成订阅内容
+    local subTxt=$(cat << EOF
+vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}
+
+vmess://${encodedVmess}
+
+trojan://${UUID}@${CFIP}:${CFPORT}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}
+EOF
+    )
+    
+    # 保存base64编码的订阅
+    local encodedSub=$(echo "$subTxt" | base64 -w 0)
+    echo "$encodedSub" > "$subPath"
+    echo "Sub content saved to $subPath"
+    echo "Sub content (base64): $encodedSub"
+    
+    # 启动HTTP服务器
+    startHttpServer "$encodedSub"
+}
+
+# 启动HTTP服务器
+startHttpServer() {
+    local encodedSub=$1
+    
+    # 检查Node.js是否可用
+    if ! command -v node >/dev/null 2>&1; then
+        echo "Node.js is not available, skipping HTTP server"
+        return
     fi
     
-    if [[ $error_count -eq 0 ]]; then
-      echo "服务运行正常..."
-      sleep 30
-    else
-      sleep 5
+    # 创建简单的HTTP服务器
+    cat > "$FILE_PATH/server.js" << EOF
+const http = require('http');
+const url = require('url');
+
+const encodedSub = "$encodedSub";
+const PORT = $PORT;
+const SUB_PATH = "$SUB_PATH";
+
+const server = http.createServer((req, res) => {
+    const parsedUrl = url.parse(req.url, true);
+    
+    if (parsedUrl.pathname === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Hello world!');
+    } else if (parsedUrl.pathname === '/' + SUB_PATH) {
+        res.writeHead(200, { 
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Access-Control-Allow-Origin': '*'
+        });
+        res.end(encodedSub);
+    } else {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not Found');
+    }
+});
+
+server.listen(PORT, () => {
+    console.log('HTTP server is running on port: ' + PORT);
+    console.log('Subscription available at: http://[server-ip]:' + PORT + '/' + SUB_PATH);
+});
+
+// 优雅退出
+process.on('SIGINT', () => {
+    console.log('Shutting down server...');
+    server.close(() => {
+        process.exit(0);
+    });
+});
+EOF
+    
+    # 启动服务器
+    echo "Starting HTTP server on port $PORT..."
+    node "$FILE_PATH/server.js" &
+    echo "HTTP server started"
+}
+
+# 上传节点
+uploadNodes() {
+    if [ -z "$UPLOAD_URL" ]; then
+        echo "UPLOAD_URL not set, skipping upload"
+        return
     fi
-  done
-  
-  # 清理进程
-  kill $xray_pid $argo_pid 2>/dev/null || true
-  echo "服务停止，准备重启..."
-  return 1
-}
-
-# ========== 清理函数 ==========
-cleanup() {
-  echo "正在清理..."
-  pkill -f "xray" || true
-  pkill -f "cloudflared" || true
-  sleep 2
-}
-
-# ========== 测试 Argo 连接 ==========
-test_argo_connection() {
-  echo "测试 Argo 隧道连接..."
-  local max_retries=3
-  local retry_count=0
-  
-  while [[ $retry_count -lt $max_retries ]]; do
-    if curl -s --connect-timeout 10 "https://$ARGO_DOMAIN" > /dev/null; then
-      echo "Argo 隧道连接测试成功"
-      return 0
-    else
-      echo "Argo 隧道连接测试失败 (尝试 $((retry_count + 1))/$max_retries)"
-      ((retry_count++))
-      sleep 5
+    
+    if [ ! -f "$subPath" ]; then
+        echo "Sub file not found, skipping upload"
+        return
     fi
-  done
-  
-  echo "Argo 隧道连接测试最终失败"
-  return 1
+    
+    local content
+    content=$(cat "$subPath")
+    local decoded=$(echo "$content" | base64 -d 2>/dev/null)
+    
+    if [ $? -ne 0 ]; then
+        echo "Failed to decode sub file"
+        return
+    fi
+    
+    # 提取节点
+    local nodes=()
+    while IFS= read -r line; do
+        if [[ $line =~ (vless|vmess|trojan|hysteria2|tuic):// ]]; then
+            nodes+=("$line")
+        fi
+    done <<< "$decoded"
+    
+    if [ ${#nodes[@]} -eq 0 ]; then
+        echo "No nodes found to upload"
+        return
+    fi
+    
+    # 构建JSON数据
+    local jsonData="{\"nodes\":["
+    for ((i=0; i<${#nodes[@]}; i++)); do
+        jsonData+="\"${nodes[i]}\""
+        if [ $i -lt $((${#nodes[@]} - 1)) ]; then
+            jsonData+=","
+        fi
+    done
+    jsonData+="]}"
+    
+    # 上传节点
+    if command -v curl >/dev/null 2>&1; then
+        curl -X POST \
+            -H "Content-Type: application/json" \
+            -d "$jsonData" \
+            "$UPLOAD_URL/api/add-nodes" >/dev/null 2>&1
+        
+        if [ $? -eq 0 ]; then
+            echo "Nodes uploaded successfully"
+        else
+            echo "Failed to upload nodes"
+        fi
+    else
+        echo "curl not available, cannot upload nodes"
+    fi
 }
 
-# ========== 主函数 ==========
+# 清理文件
+cleanFiles() {
+    echo "Cleaning up files in 90 seconds..."
+    sleep 90
+    
+    rm -f "$bootLogPath" "$configPath" "$webPath" "$botPath" \
+          "$FILE_PATH/tunnel.json" "$FILE_PATH/tunnel.yml" \
+          "$FILE_PATH/server.js" 2>/dev/null || true
+    
+    echo "Cleanup completed"
+    echo "App is running"
+    echo "Thank you for using this script, enjoy!"
+}
+
+# 主运行逻辑
 main() {
-  echo "开始部署 VLESS + TCP + Reality with Argo Tunnel"
-  
-  # 设置退出时清理
-  trap cleanup EXIT
-  
-  # 系统检查
-  check_system
-  
-  # 检查依赖
-  if ! check_dependencies; then
-    echo "请安装缺失的依赖后重试"
-    exit 1
-  fi
-
-  # 加载配置和生成 UUID
-  load_config
-  [[ -z "${VLESS_UUID:-}" ]] && VLESS_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)
-  echo "使用 UUID: $VLESS_UUID"
-
-  # 下载和设置组件
-  if ! get_xray; then
-    echo "Xray 设置失败"
-    exit 1
-  fi
-  
-  if ! setup_argo; then
-    echo "Argo 隧道设置失败"
-    # 不退出，尝试继续运行
-  fi
-  
-  if ! gen_vless_config; then
-    echo "VLESS 配置生成失败"
-    exit 1
-  fi
-
-  # 获取 IP 并生成链接
-  ip=$(curl -s --connect-timeout 5 https://api64.ipify.org || echo "127.0.0.1")
-  gen_link "$ip"
-
-  # 持续运行服务
-  while true; do
-    if run_services; then
-      echo "服务正常重启中..."
-    else
-      echo "服务启动失败，等待后重试..."
-    fi
-    sleep 10
-  done
+    echo "Starting server setup..."
+    
+    cleanupOldFiles
+    generateConfig
+    downloadFilesAndRun
+    extractDomains
+    uploadNodes
+    
+    # 在后台运行清理任务
+    cleanFiles &
+    
+    echo "Setup completed successfully!"
+    echo "HTTP server should be running on port $PORT"
+    echo "Check the output above for subscription information"
+    
+    # 保持脚本运行
+    wait
 }
+
+# 捕获退出信号
+trap 'echo "Script interrupted"; exit 0' INT TERM
 
 # 运行主函数
 main "$@"
