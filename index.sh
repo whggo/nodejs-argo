@@ -9,8 +9,8 @@ set -uo pipefail
 # ========== 环境变量配置 ==========
 export ARGO_DOMAIN="${ARGO_DOMAIN:-appwrite.777171.xyz}"
 export ARGO_AUTH="${ARGO_AUTH:-eyJhIjoiMTZjM2Q3ZWUyZjlmZmRiZmVlY2IzYTJlMThkMDE2ZjgiLCJ0IjoiZTI3YzI5MWUtMGNlZS00MTVjLWE1ZmEtMjllZjY4OGIzYzk3IiwicyI6Ik1UQmhNakl5WlRFdE1XWmpOaTAwTnprNUxUaGpPVEF0TVdJM05EWTVaRFkxWkRaaSJ9}"
-export ARGO_PORT="${ARGO_PORT:-8001}"
-export CFIP="${CFIP:-cdns.doon.eu.org}"
+export ARGO_PORT="${ARGO_PORT:-9767}"  # 改为你的可用端口
+export CFIP="${CFIP:-www.visa.com.tw}"
 export CFPORT="${CFPORT:-443}"
 export NAME="${NAME:-}"
 export FILE_PATH="${FILE_PATH:-./tmp}"
@@ -125,7 +125,10 @@ gen_vless_config() {
     },
     "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
   }],
-  "outbounds": [{"protocol": "freedom"}]
+  "outbounds": [
+    {"protocol": "freedom", "tag": "direct"},
+    {"protocol": "blackhole", "tag": "block"}
+  ]
 }
 EOF
 
@@ -136,6 +139,82 @@ Reality Short ID: $shortId
 VLESS UUID: $VLESS_UUID
 Port: $PORT
 EOF
+}
+
+# ========== 生成 WebSocket 配置（用于 Argo 隧道）==========
+gen_ws_config() {
+  cat > "ws-config.json" <<EOF
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [
+    {
+      "port": $ARGO_PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [{"id": "$VLESS_UUID", "flow": ""}],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "${FILE_PATH}/self-signed.crt",
+              "keyFile": "${FILE_PATH}/self-signed.key"
+            }
+          ]
+        },
+        "wsSettings": {
+          "path": "/vless"
+        }
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
+    },
+    {
+      "port": 3002,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [{"id": "$VLESS_UUID"}]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/vmess"
+        }
+      }
+    },
+    {
+      "port": 3003,
+      "protocol": "trojan",
+      "settings": {
+        "clients": [{"password": "$VLESS_UUID"}]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "/trojan"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {"protocol": "freedom", "tag": "direct"},
+    {"protocol": "blackhole", "tag": "block"}
+  ]
+}
+EOF
+}
+
+# ========== 生成自签名证书 ==========
+gen_self_signed_cert() {
+  echo "Generating self-signed certificate..."
+  openssl req -x509 -newkey rsa:2048 -keyout "${FILE_PATH}/self-signed.key" -out "${FILE_PATH}/self-signed.crt" -days 3650 -nodes -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost" 2>/dev/null
+  if [[ $? -eq 0 ]]; then
+    echo "Self-signed certificate generated successfully"
+  else
+    echo "Warning: Failed to generate self-signed certificate"
+  fi
 }
 
 # ========== 配置 Argo 隧道 ==========
@@ -153,7 +232,7 @@ protocol: http2
 
 ingress:
   - hostname: $ARGO_DOMAIN
-    service: http://localhost:$ARGO_PORT
+    service: https://localhost:$ARGO_PORT
     originRequest:
       noTLSVerify: true
   - service: http_status:404
@@ -168,7 +247,7 @@ EOF
 
 # ========== 启动 Argo 隧道 ==========
 start_argo() {
-  echo "Starting Argo tunnel..."
+  echo "Starting Argo tunnel on port $ARGO_PORT..."
   
   local args
   if [[ -n "$ARGO_AUTH" && "$ARGO_AUTH" =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
@@ -178,8 +257,8 @@ start_argo() {
     # 配置文件认证
     args="tunnel --edge-ip-version auto --config $TUNNEL_CONFIG run"
   else
-    # 快速隧道
-    args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile $BOOT_LOG --loglevel info --url http://localhost:$ARGO_PORT"
+    # 快速隧道 - 使用可用端口
+    args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile $BOOT_LOG --loglevel info --url https://localhost:$ARGO_PORT"
   fi
 
   nohup "$BOT_BIN" $args >/dev/null 2>&1 &
@@ -230,7 +309,7 @@ generate_subscription() {
   fi
   
   # 生成各种协议链接
-  local vless_link="vless://${VLESS_UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argo_domain}&fp=firefox&type=ws&host=${argo_domain}&path=%2Fvless-argo%3Fed%3D2560#${node_name}"
+  local vless_link="vless://${VLESS_UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argo_domain}&fp=firefox&type=ws&host=${argo_domain}&path=%2Fvless#${node_name}"
   
   local vmess_config='{
     "v": "2",
@@ -243,7 +322,7 @@ generate_subscription() {
     "net": "ws",
     "type": "none",
     "host": "'"${argo_domain}"'",
-    "path": "/vmess-argo?ed=2560",
+    "path": "/vmess",
     "tls": "tls",
     "sni": "'"${argo_domain}"'",
     "alpn": "",
@@ -251,7 +330,7 @@ generate_subscription() {
   }'
   local vmess_link="vmess://$(echo "$vmess_config" | base64 -w 0)"
   
-  local trojan_link="trojan://${VLESS_UUID}@${CFIP}:${CFPORT}?security=tls&sni=${argo_domain}&fp=firefox&type=ws&host=${argo_domain}&path=%2Ftrojan-argo%3Fed%3D2560#${node_name}"
+  local trojan_link="trojan://${VLESS_UUID}@${CFIP}:${CFPORT}?security=tls&sni=${argo_domain}&fp=firefox&type=ws&host=${argo_domain}&path=%2Ftrojan#${node_name}"
   
   # 生成订阅内容
   local sub_content="
@@ -285,12 +364,31 @@ cleanup() {
   echo "Cleaning up..."
   pkill -f "$BOT_BIN" 2>/dev/null || true
   pkill -f "$VLESS_BIN" 2>/dev/null || true
-  rm -f "$BOOT_LOG" "$TUNNEL_CONFIG" "$TUNNEL_JSON" xray.zip
+  rm -f "$BOOT_LOG" "$TUNNEL_CONFIG" "$TUNNEL_JSON" xray.zip "ws-config.json"
+}
+
+# ========== 检查端口是否可用 ==========
+check_port_availability() {
+  local port=$1
+  if command -v netstat >/dev/null 2>&1; then
+    if netstat -tuln | grep -q ":$port "; then
+      echo "Port $port is already in use"
+      return 1
+    fi
+  fi
+  return 0
 }
 
 # ========== 主函数 ==========
 main() {
   echo "Deploying VLESS + TCP + Reality + Argo Tunnel"
+  echo "Using port $ARGO_PORT for Argo tunnel"
+  
+  # 检查端口可用性
+  if ! check_port_availability $ARGO_PORT; then
+    echo "Please choose a different port or stop the service using port $ARGO_PORT"
+    exit 1
+  fi
   
   # 设置退出时清理
   trap cleanup EXIT
@@ -304,13 +402,18 @@ main() {
   local arch=$(get_arch)
   download_components "$arch"
   
-  # 生成配置
+  # 生成配置和证书
   gen_vless_config
+  gen_ws_config
+  gen_self_signed_cert
   configure_argo
   
   # 启动服务
   echo "Starting VLESS Reality on :$PORT (XTLS-Vision)..."
   nohup "$VLESS_BIN" run -c "$VLESS_CONFIG" >/dev/null 2>&1 &
+  
+  echo "Starting WebSocket proxy on :$ARGO_PORT (for Argo)..."
+  nohup "$VLESS_BIN" run -c "ws-config.json" >/dev/null 2>&1 &
   
   # 启动 Argo
   start_argo
@@ -330,14 +433,24 @@ main() {
     echo "Setup completed successfully!"
     echo "Argo Domain: $argo_domain"
     echo "Reality Port: $PORT"
+    echo "WebSocket Port: $ARGO_PORT"
     echo "Subscription saved to: ${FILE_PATH}/sub.txt"
     echo "========================================="
+    
+    # 显示连接信息
+    echo "Connection Info:"
+    echo "- Reality Direct: vless://...@your-server-ip:$PORT?type=tcp&security=reality..."
+    echo "- Argo Tunnel: Use the subscription above"
+    
   else
     echo "Warning: Could not obtain Argo domain"
+    echo "You can still use direct Reality connection on port $PORT"
   fi
   
   # 保持脚本运行
   echo "All services are running. Press Ctrl+C to stop."
+  echo "Reality service on port: $PORT"
+  echo "Argo tunnel on port: $ARGO_PORT"
   wait
 }
 
