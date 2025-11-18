@@ -2,6 +2,8 @@
 
 # nodejs-argo隧道代理
 
+curl -Ls https://github.com/whggo/nodejs-argo/raw/refs/heads/main/index.sh | sed 's/\r$//' | bash
+
 [![npm version](https://img.shields.io/npm/v/nodejs-argo.svg)](https://www.npmjs.com/package/nodejs-argo)
 [![npm downloads](https://img.shields.io/npm/dm/nodejs-argo.svg)](https://www.npmjs.com/package/nodejs-argo)
 [![License](https://img.shields.io/npm/l/nodejs-argo.svg)](https://github.com/eooce/nodejs-argo/blob/main/LICENSE)
