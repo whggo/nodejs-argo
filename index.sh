@@ -111,22 +111,36 @@ setup_argo() {
     echo "Cloudflared 下载成功"
   fi
 
-  # 创建凭证文件
+  # 创建凭证文件（直接使用 token）
   echo "创建 Argo 隧道凭证..."
   cat > credentials.json <<EOF
 $ARGO_TOKEN
 EOF
 
-  # 解析隧道 ID
-  local tunnel_id=$(echo "$ARGO_TOKEN" | base64 -d 2>/dev/null | grep -o '"tunnelID":"[^"]*' | cut -d'"' -f4 2>/dev/null || echo "argo-tunnel")
+  # 解析隧道信息
+  local tunnel_info=$(echo "$ARGO_TOKEN" | base64 -d 2>/dev/null || echo "")
+  local tunnel_id=""
+  local account_tag=""
   
-  # 创建 Argo 隧道配置（修复：添加 noTLSVerify 和移除 origin cert 要求）
+  if [[ -n "$tunnel_info" ]]; then
+    tunnel_id=$(echo "$tunnel_info" | grep -o '"tunnelID":"[^"]*' | cut -d'"' -f4 2>/dev/null || echo "")
+    account_tag=$(echo "$tunnel_info" | grep -o '"a":"[^"]*' | cut -d'"' -f4 2>/dev/null || echo "")
+  fi
+  
+  # 如果解析失败，使用默认值
+  if [[ -z "$tunnel_id" ]]; then
+    tunnel_id="argo-tunnel"
+  fi
+  if [[ -z "$account_tag" ]]; then
+    account_tag="unknown"
+  fi
+
+  # 创建正确的 Argo 隧道配置（参考 JavaScript 版本）
   cat > "$ARGO_CONFIG" <<EOF
 tunnel: $tunnel_id
 credentials-file: credentials.json
-no-tls-verify: true
-originRequest:
-  noTLSVerify: true
+protocol: http2
+
 ingress:
   - hostname: $ARGO_DOMAIN
     service: http://localhost:$PORT
@@ -136,6 +150,8 @@ ingress:
 EOF
 
   echo "Argo 隧道配置完成"
+  echo "隧道ID: $tunnel_id"
+  echo "账户标签: $account_tag"
 }
 
 # ========== 生成 VLESS Reality 配置 ==========
@@ -267,17 +283,23 @@ run_services() {
   
   echo "Xray 启动成功 (PID: $xray_pid)"
   
-  # 启动 Argo 隧道（使用 no-autoupdate 避免自动更新问题）
+  # 启动 Argo 隧道（使用正确的配置格式）
   echo "Starting Argo Tunnel..."
-  "$ARGO_BIN" tunnel --config "$ARGO_CONFIG" --no-autoupdate run &
+  "$ARGO_BIN" tunnel --config "$ARGO_CONFIG" run &
   local argo_pid=$!
   
-  # 等待 Argo 启动更长时间
+  # 等待 Argo 启动
   sleep 10
   
   # 检查 Argo 是否正常运行
   if ! kill -0 $argo_pid 2>/dev/null; then
     echo "错误: Argo Tunnel 启动失败"
+    # 显示可能的错误信息
+    if [[ -f "boot.log" ]]; then
+      echo "=== Argo 错误日志 ==="
+      tail -n 10 boot.log 2>/dev/null || true
+      echo "===================="
+    fi
     kill $xray_pid 2>/dev/null || true
     return 1
   fi
@@ -285,8 +307,8 @@ run_services() {
   echo "Argo Tunnel 启动成功 (PID: $argo_pid)"
   echo "所有服务启动完成!"
   
-  # 显示 Argo 状态
-  echo "检查 Argo 隧道状态..."
+  # 显示隧道状态
+  echo "检查隧道状态..."
   sleep 5
   
   # 健康检查循环
