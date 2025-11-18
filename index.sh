@@ -120,13 +120,18 @@ EOF
   # 解析隧道 ID
   local tunnel_id=$(echo "$ARGO_TOKEN" | base64 -d 2>/dev/null | grep -o '"tunnelID":"[^"]*' | cut -d'"' -f4 2>/dev/null || echo "argo-tunnel")
   
-  # 创建 Argo 隧道配置
+  # 创建 Argo 隧道配置（修复：添加 noTLSVerify 和移除 origin cert 要求）
   cat > "$ARGO_CONFIG" <<EOF
 tunnel: $tunnel_id
 credentials-file: credentials.json
+no-tls-verify: true
+originRequest:
+  noTLSVerify: true
 ingress:
   - hostname: $ARGO_DOMAIN
     service: http://localhost:$PORT
+    originRequest:
+      noTLSVerify: true
   - service: http_status:404
 EOF
 
@@ -262,38 +267,68 @@ run_services() {
   
   echo "Xray 启动成功 (PID: $xray_pid)"
   
-  # 启动 Argo 隧道
+  # 启动 Argo 隧道（使用 no-autoupdate 避免自动更新问题）
   echo "Starting Argo Tunnel..."
-  "$ARGO_BIN" tunnel --config "$ARGO_CONFIG" run &
+  "$ARGO_BIN" tunnel --config "$ARGO_CONFIG" --no-autoupdate run &
   local argo_pid=$!
   
-  # 等待 Argo 启动
-  sleep 5
+  # 等待 Argo 启动更长时间
+  sleep 10
+  
+  # 检查 Argo 是否正常运行
+  if ! kill -0 $argo_pid 2>/dev/null; then
+    echo "错误: Argo Tunnel 启动失败"
+    kill $xray_pid 2>/dev/null || true
+    return 1
+  fi
   
   echo "Argo Tunnel 启动成功 (PID: $argo_pid)"
   echo "所有服务启动完成!"
   
+  # 显示 Argo 状态
+  echo "检查 Argo 隧道状态..."
+  sleep 5
+  
   # 健康检查循环
-  while true; do
+  local error_count=0
+  while [[ $error_count -lt 3 ]]; do
     if ! kill -0 $xray_pid 2>/dev/null; then
       echo "Xray 进程异常退出"
-      break
+      ((error_count++))
     fi
     if ! kill -0 $argo_pid 2>/dev/null; then
       echo "Argo Tunnel 进程异常退出"
-      break
+      ((error_count++))
     fi
-    sleep 10
+    
+    if [[ $error_count -eq 0 ]]; then
+      echo "服务运行正常..."
+      sleep 30
+    else
+      sleep 5
+    fi
   done
   
   # 清理进程
   kill $xray_pid $argo_pid 2>/dev/null || true
   echo "服务停止，准备重启..."
+  return 1
+}
+
+# ========== 清理函数 ==========
+cleanup() {
+  echo "正在清理..."
+  pkill -f "xray" || true
+  pkill -f "cloudflared" || true
+  sleep 2
 }
 
 # ========== 主函数 ==========
 main() {
   echo "开始部署 VLESS + TCP + Reality with Argo Tunnel"
+  
+  # 设置退出时清理
+  trap cleanup EXIT
   
   # 系统检查
   check_system
@@ -336,7 +371,7 @@ main() {
     else
       echo "服务启动失败，等待后重试..."
     fi
-    sleep 5
+    sleep 10
   done
 }
 
