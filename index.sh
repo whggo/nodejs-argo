@@ -111,7 +111,7 @@ setup_argo() {
     echo "Cloudflared 下载成功"
   fi
 
-  # 创建凭证文件（直接使用 token）
+  # 创建凭证文件
   echo "创建 Argo 隧道凭证..."
   cat > credentials.json <<EOF
 $ARGO_TOKEN
@@ -120,19 +120,14 @@ EOF
   # 解析隧道信息
   local tunnel_info=$(echo "$ARGO_TOKEN" | base64 -d 2>/dev/null || echo "")
   local tunnel_id=""
-  local account_tag=""
   
   if [[ -n "$tunnel_info" ]]; then
     tunnel_id=$(echo "$tunnel_info" | grep -o '"tunnelID":"[^"]*' | cut -d'"' -f4 2>/dev/null || echo "")
-    account_tag=$(echo "$tunnel_info" | grep -o '"a":"[^"]*' | cut -d'"' -f4 2>/dev/null || echo "")
   fi
   
   # 如果解析失败，使用默认值
   if [[ -z "$tunnel_id" ]]; then
     tunnel_id="argo-tunnel"
-  fi
-  if [[ -z "$account_tag" ]]; then
-    account_tag="unknown"
   fi
 
   # 创建正确的 Argo 隧道配置（参考 JavaScript 版本）
@@ -151,7 +146,6 @@ EOF
 
   echo "Argo 隧道配置完成"
   echo "隧道ID: $tunnel_id"
-  echo "账户标签: $account_tag"
 }
 
 # ========== 生成 VLESS Reality 配置 ==========
@@ -260,6 +254,40 @@ check_port() {
   fi
 }
 
+# ========== 启动 Argo 隧道（使用 token 方式）==========
+start_argo_tunnel() {
+  echo "启动 Argo 隧道..."
+  
+  # 方法1：使用 token 直接运行（推荐）
+  if [[ "$ARGO_TOKEN" =~ ^eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*$ ]]; then
+    echo "使用 Token 方式启动 Argo 隧道..."
+    "$ARGO_BIN" tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token "$ARGO_TOKEN" &
+    local argo_pid=$!
+  # 方法2：使用配置文件
+  elif [[ -f "$ARGO_CONFIG" ]]; then
+    echo "使用配置文件启动 Argo 隧道..."
+    "$ARGO_BIN" tunnel --config "$ARGO_CONFIG" run &
+    local argo_pid=$!
+  # 方法3：使用快速隧道
+  else
+    echo "使用快速隧道..."
+    "$ARGO_BIN" tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --url "http://localhost:$PORT" &
+    local argo_pid=$!
+  fi
+  
+  # 等待隧道启动
+  sleep 10
+  
+  # 检查隧道是否正常运行
+  if ! kill -0 $argo_pid 2>/dev/null; then
+    echo "错误: Argo 隧道启动失败"
+    return 1
+  fi
+  
+  echo "Argo 隧道启动成功 (PID: $argo_pid)"
+  return $argo_pid
+}
+
 # ========== 启动服务 ==========
 run_services() {
   echo "启动 VLESS Reality 服务..."
@@ -283,33 +311,28 @@ run_services() {
   
   echo "Xray 启动成功 (PID: $xray_pid)"
   
-  # 启动 Argo 隧道（使用正确的配置格式）
-  echo "Starting Argo Tunnel..."
-  "$ARGO_BIN" tunnel --config "$ARGO_CONFIG" run &
-  local argo_pid=$!
-  
-  # 等待 Argo 启动
-  sleep 10
-  
-  # 检查 Argo 是否正常运行
-  if ! kill -0 $argo_pid 2>/dev/null; then
-    echo "错误: Argo Tunnel 启动失败"
-    # 显示可能的错误信息
-    if [[ -f "boot.log" ]]; then
-      echo "=== Argo 错误日志 ==="
-      tail -n 10 boot.log 2>/dev/null || true
-      echo "===================="
+  # 启动 Argo 隧道
+  local argo_pid
+  if start_argo_tunnel; then
+    argo_pid=$?
+  else
+    echo "尝试使用备用方式启动 Argo 隧道..."
+    # 备用方式：直接使用 token
+    "$ARGO_BIN" tunnel run --token "$ARGO_TOKEN" &
+    argo_pid=$!
+    sleep 10
+    
+    if ! kill -0 $argo_pid 2>/dev/null; then
+      echo "Argo 隧道启动失败，但 Xray 仍在运行"
+      # 即使 Argo 失败，也继续运行 Xray
+      wait $xray_pid
+      return 1
     fi
-    kill $xray_pid 2>/dev/null || true
-    return 1
   fi
   
-  echo "Argo Tunnel 启动成功 (PID: $argo_pid)"
   echo "所有服务启动完成!"
-  
-  # 显示隧道状态
-  echo "检查隧道状态..."
-  sleep 5
+  echo "Xray PID: $xray_pid"
+  echo "Argo Tunnel PID: $argo_pid"
   
   # 健康检查循环
   local error_count=0
@@ -345,6 +368,27 @@ cleanup() {
   sleep 2
 }
 
+# ========== 测试 Argo 连接 ==========
+test_argo_connection() {
+  echo "测试 Argo 隧道连接..."
+  local max_retries=3
+  local retry_count=0
+  
+  while [[ $retry_count -lt $max_retries ]]; do
+    if curl -s --connect-timeout 10 "https://$ARGO_DOMAIN" > /dev/null; then
+      echo "Argo 隧道连接测试成功"
+      return 0
+    else
+      echo "Argo 隧道连接测试失败 (尝试 $((retry_count + 1))/$max_retries)"
+      ((retry_count++))
+      sleep 5
+    fi
+  done
+  
+  echo "Argo 隧道连接测试最终失败"
+  return 1
+}
+
 # ========== 主函数 ==========
 main() {
   echo "开始部署 VLESS + TCP + Reality with Argo Tunnel"
@@ -374,7 +418,7 @@ main() {
   
   if ! setup_argo; then
     echo "Argo 隧道设置失败"
-    exit 1
+    # 不退出，尝试继续运行
   fi
   
   if ! gen_vless_config; then
