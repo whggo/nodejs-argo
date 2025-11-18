@@ -31,6 +31,28 @@ VLESS_BIN="./xray"
 VLESS_CONFIG="vless-reality.json"
 VLESS_LINK="vless_link.txt"
 
+# ========== 系统检查 ==========
+check_system() {
+  echo "=== 系统信息 ==="
+  echo "系统架构: $(uname -m)"
+  echo "当前用户: $(whoami)"
+  echo "工作目录: $(pwd)"
+  echo "================"
+}
+
+# ========== 依赖检查 ==========
+check_dependencies() {
+  local deps=("curl" "unzip" "openssl")
+  for dep in "${deps[@]}"; do
+    if ! command -v "$dep" &> /dev/null; then
+      echo "错误: 缺少依赖 $dep"
+      return 1
+    fi
+  done
+  echo "所有依赖检查通过"
+  return 0
+}
+
 # ========== 加载已有配置 ==========
 load_config() {
   if [[ -f "$VLESS_CONFIG" ]]; then
@@ -42,18 +64,36 @@ load_config() {
 # ========== 下载 Xray ==========
 get_xray() {
   if [[ ! -x "$VLESS_BIN" ]]; then
-    echo "Downloading Xray v1.8.23..."
-    curl -L -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v1.8.23/Xray-linux-64.zip" --fail --connect-timeout 15
-    unzip -j xray.zip xray -d . >/dev/null 2>&1
+    echo "下载 Xray v1.8.23..."
+    if ! curl -L -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/v1.8.23/Xray-linux-64.zip" --fail --connect-timeout 15; then
+      echo "错误: 下载 Xray 失败"
+      return 1
+    fi
+    
+    if ! unzip -j xray.zip xray -d . >/dev/null 2>&1; then
+      echo "错误: 解压 Xray 失败"
+      rm -f xray.zip
+      return 1
+    fi
+    
     rm -f xray.zip
     chmod +x "$VLESS_BIN"
+    
+    # 验证 Xray 是否可用
+    if ! "$VLESS_BIN" version >/dev/null 2>&1; then
+      echo "错误: Xray 验证失败"
+      return 1
+    fi
+    echo "Xray 下载和验证成功"
+  else
+    echo "Xray 已存在"
   fi
 }
 
 # ========== 下载和配置 Cloudflared ==========
 setup_argo() {
   if [[ ! -x "$ARGO_BIN" ]]; then
-    echo "Downloading Cloudflared..."
+    echo "下载 Cloudflared..."
     local arch=$(uname -m)
     case "$arch" in
       x86_64) local pkg="cloudflared-linux-amd64" ;;
@@ -62,13 +102,27 @@ setup_argo() {
       *) local pkg="cloudflared-linux-amd64" ;;
     esac
     
-    curl -L -o "$ARGO_BIN" "https://github.com/cloudflare/cloudflared/releases/latest/download/$pkg" --fail --connect-timeout 15
+    if ! curl -L -o "$ARGO_BIN" "https://github.com/cloudflare/cloudflared/releases/latest/download/$pkg" --fail --connect-timeout 15; then
+      echo "错误: 下载 Cloudflared 失败"
+      return 1
+    fi
+    
     chmod +x "$ARGO_BIN"
+    echo "Cloudflared 下载成功"
   fi
 
+  # 创建凭证文件
+  echo "创建 Argo 隧道凭证..."
+  cat > credentials.json <<EOF
+$ARGO_TOKEN
+EOF
+
+  # 解析隧道 ID
+  local tunnel_id=$(echo "$ARGO_TOKEN" | base64 -d 2>/dev/null | grep -o '"tunnelID":"[^"]*' | cut -d'"' -f4 2>/dev/null || echo "argo-tunnel")
+  
   # 创建 Argo 隧道配置
   cat > "$ARGO_CONFIG" <<EOF
-tunnel: $(echo "$ARGO_TOKEN" | base64 -d 2>/dev/null | grep -o '"tunnelID":"[^"]*' | cut -d'"' -f4 2>/dev/null || echo "argo-tunnel")
+tunnel: $tunnel_id
 credentials-file: credentials.json
 ingress:
   - hostname: $ARGO_DOMAIN
@@ -76,18 +130,30 @@ ingress:
   - service: http_status:404
 EOF
 
-  # 创建凭证文件
-  cat > credentials.json <<EOF
-{"AccountTag":"$(echo "$ARGO_TOKEN" | base64 -d 2>/dev/null | grep -o '"a":"[^"]*' | cut -d'"' -f4 2>/dev/null || echo "unknown")","TunnelSecret":"$(echo "$ARGO_TOKEN" | base64 -d 2>/dev/null | grep -o '"s":"[^"]*' | cut -d'"' -f4 2>/dev/null || echo "unknown")","TunnelID":"$(echo "$ARGO_TOKEN" | base64 -d 2>/dev/null | grep -o '"t":"[^"]*' | cut -d'"' -f4 2>/dev/null || echo "unknown")","TunnelName":"$(echo "$ARGO_TOKEN" | base64 -d 2>/dev/null | grep -o '"tunnelID":"[^"]*' | cut -d'"' -f4 2>/dev/null || echo "argo-tunnel")"}
-EOF
+  echo "Argo 隧道配置完成"
 }
 
 # ========== 生成 VLESS Reality 配置 ==========
 gen_vless_config() {
+  echo "生成 VLESS Reality 配置..."
+  
   local shortId=$(openssl rand -hex 8)
-  local keys=$("$VLESS_BIN" x25519 2>/dev/null || echo "Private key: fallbackpriv1234567890abcdef1234567890abcdef\nPublic key: fallbackpubk1234567890abcdef1234567890abcdef")
-  local priv=$(echo "$keys" | grep Private | awk '{print $3}')
-  local pub=$(echo "$keys" | grep Public | awk '{print $3}')
+  
+  # 生成密钥对
+  local keys
+  if ! keys=$("$VLESS_BIN" x25519 2>/dev/null); then
+    echo "错误: 无法生成 X25519 密钥"
+    return 1
+  fi
+  
+  local priv=$(echo "$keys" | grep -i private | awk '{print $3}')
+  local pub=$(echo "$keys" | grep -i public | awk '{print $3}')
+  
+  # 验证密钥是否有效
+  if [[ -z "$priv" || -z "$pub" ]]; then
+    echo "错误: 生成的密钥无效"
+    return 1
+  fi
 
   cat > "$VLESS_CONFIG" <<EOF
 {
@@ -127,7 +193,10 @@ Reality Short ID: $shortId
 VLESS UUID: $VLESS_UUID
 Port: $PORT
 Argo Domain: $ARGO_DOMAIN
+Masquerade Domain: $MASQ_DOMAIN
 EOF
+
+  echo "VLESS 配置生成成功"
 }
 
 # ========== 生成客户端链接 ==========
@@ -149,54 +218,127 @@ EOF
   echo "VLESS + TCP + Reality 节点信息:"
   echo "直接连接: $ip:$PORT"
   echo "Argo 隧道: $ARGO_DOMAIN:443"
+  echo "UUID: $VLESS_UUID"
+  echo "Public Key: $pub"
+  echo "Short ID: $sid"
   echo "========================================="
   cat "$VLESS_LINK"
   echo "========================================="
 }
 
+# ========== 检查端口占用 ==========
+check_port() {
+  if command -v netstat >/dev/null 2>&1; then
+    if netstat -tln | grep -q ":$PORT "; then
+      echo "警告: 端口 $PORT 已被占用"
+    fi
+  elif command -v ss >/dev/null 2>&1; then
+    if ss -tln | grep -q ":$PORT "; then
+      echo "警告: 端口 $PORT 已被占用"
+    fi
+  fi
+}
+
 # ========== 启动服务 ==========
 run_services() {
-  echo "Starting VLESS Reality on :$PORT (XTLS-Vision)..."
+  echo "启动 VLESS Reality 服务..."
   
-  # 启动 Xray
+  # 检查端口
+  check_port
+  
+  # 先启动 Xray
+  echo "Starting Xray on port :$PORT..."
   "$VLESS_BIN" run -c "$VLESS_CONFIG" &
   local xray_pid=$!
   
-  echo "Starting Argo Tunnel..."
+  # 等待 Xray 启动
+  sleep 3
+  
+  # 检查 Xray 是否正常运行
+  if ! kill -0 $xray_pid 2>/dev/null; then
+    echo "错误: Xray 启动失败"
+    return 1
+  fi
+  
+  echo "Xray 启动成功 (PID: $xray_pid)"
+  
   # 启动 Argo 隧道
+  echo "Starting Argo Tunnel..."
   "$ARGO_BIN" tunnel --config "$ARGO_CONFIG" run &
   local argo_pid=$!
   
-  echo "服务启动完成!"
-  echo "Xray PID: $xray_pid"
-  echo "Argo Tunnel PID: $argo_pid"
-  
-  # 等待进程
-  wait -n $xray_pid $argo_pid
-  echo "有服务异常退出，正在重启..."
-  kill $xray_pid $argo_pid 2>/dev/null || true
+  # 等待 Argo 启动
   sleep 5
+  
+  echo "Argo Tunnel 启动成功 (PID: $argo_pid)"
+  echo "所有服务启动完成!"
+  
+  # 健康检查循环
+  while true; do
+    if ! kill -0 $xray_pid 2>/dev/null; then
+      echo "Xray 进程异常退出"
+      break
+    fi
+    if ! kill -0 $argo_pid 2>/dev/null; then
+      echo "Argo Tunnel 进程异常退出"
+      break
+    fi
+    sleep 10
+  done
+  
+  # 清理进程
+  kill $xray_pid $argo_pid 2>/dev/null || true
+  echo "服务停止，准备重启..."
 }
 
 # ========== 主函数 ==========
 main() {
-  echo "Deploying VLESS + TCP + Reality with Argo Tunnel"
+  echo "开始部署 VLESS + TCP + Reality with Argo Tunnel"
+  
+  # 系统检查
+  check_system
+  
+  # 检查依赖
+  if ! check_dependencies; then
+    echo "请安装缺失的依赖后重试"
+    exit 1
+  fi
 
+  # 加载配置和生成 UUID
   load_config
   [[ -z "${VLESS_UUID:-}" ]] && VLESS_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)
+  echo "使用 UUID: $VLESS_UUID"
 
-  get_xray
-  setup_argo
-  gen_vless_config
+  # 下载和设置组件
+  if ! get_xray; then
+    echo "Xray 设置失败"
+    exit 1
+  fi
+  
+  if ! setup_argo; then
+    echo "Argo 隧道设置失败"
+    exit 1
+  fi
+  
+  if ! gen_vless_config; then
+    echo "VLESS 配置生成失败"
+    exit 1
+  fi
 
-  ip=$(curl -s https://api64.ipify.org || echo "127.0.0.1")
+  # 获取 IP 并生成链接
+  ip=$(curl -s --connect-timeout 5 https://api64.ipify.org || echo "127.0.0.1")
   gen_link "$ip"
 
   # 持续运行服务
   while true; do
-    run_services
-    sleep 3
+    if run_services; then
+      echo "服务正常重启中..."
+    else
+      echo "服务启动失败，等待后重试..."
+    fi
+    sleep 5
   done
 }
 
+# 运行主函数
 main "$@"
